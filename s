@@ -1,7 +1,3 @@
-
-
-
-    
 #!/usr/bin/env python3
 
 import paramiko
@@ -14,12 +10,18 @@ DEVICE_INVENTORY_FILE = os.path.expanduser('~/network-auditor/device_inventory.y
 BASELINE_DIR = os.path.expanduser('~/network-auditor/baselines')
 REPORTS_DIR = os.path.expanduser('~/network-auditor/reports')
 
+# Ensure reports directory exists
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
 def load_yaml(file_path):
-    with open(file_path, 'r') as f:
-        return yaml.safe_load(f)
+    """Load a YAML file safely."""
+    try:
+        with open(file_path, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading YAML file {file_path}: {e}")
+        return {}
 
 
 def ssh_connect(hostname, username, password):
@@ -31,28 +33,41 @@ def ssh_connect(hostname, username, password):
 
 
 def extract_config(client):
-    """Extract SSH config, user accounts, and firewall rules."""
+    """Extract SSH config, users, and firewall rules."""
     extracted = {}
 
-    stdin, stdout, stderr = client.exec_command('cat /etc/ssh/sshd_config')
-    extracted['sshd_config'] = stdout.read().decode()
+    try:
+        stdin, stdout, stderr = client.exec_command('cat /etc/ssh/sshd_config')
+        extracted['sshd_config'] = stdout.read().decode()
+    except Exception as e:
+        print(f"Error extracting SSH config: {e}")
+        extracted['sshd_config'] = ""
 
-    stdin, stdout, stderr = client.exec_command('cat /etc/passwd')
-    extracted['users'] = stdout.read().decode()
+    try:
+        stdin, stdout, stderr = client.exec_command('cat /etc/passwd')
+        extracted['users'] = stdout.read().decode()
+    except Exception as e:
+        print(f"Error extracting users: {e}")
+        extracted['users'] = ""
 
-    stdin, stdout, stderr = client.exec_command('sudo ufw status numbered')
-    extracted['firewall'] = stdout.read().decode()
+    try:
+        stdin, stdout, stderr = client.exec_command('sudo ufw status numbered')
+        extracted['firewall'] = stdout.read().decode()
+    except Exception as e:
+        print(f"Error extracting firewall rules: {e}")
+        extracted['firewall'] = ""
 
     return extracted
 
 
 def compare_to_baseline(extracted, baseline):
+    """Compare extracted configuration to baseline and return violations."""
     violations = []
 
-    # SSH config comparison
+    # SSH config
     for key, expected_value in baseline.get('sshd_config', {}).items():
         actual_value = None
-        for line in extracted['sshd_config'].splitlines():
+        for line in extracted.get('sshd_config', '').splitlines():
             if line.strip().startswith(key):
                 actual_value = line.split()[-1]
         if actual_value != expected_value:
@@ -66,8 +81,8 @@ def compare_to_baseline(extracted, baseline):
                 'recommendation': f"Set {key} to {expected_value}"
             })
 
-    # User accounts comparison
-    actual_users = set(line.split(':')[0] for line in extracted['users'].splitlines())
+    # Users
+    actual_users = set(line.split(':')[0] for line in extracted.get('users', '').splitlines())
     for baseline_user in baseline.get('users', []):
         if baseline_user not in actual_users:
             violations.append({
@@ -76,12 +91,12 @@ def compare_to_baseline(extracted, baseline):
                 'expected': 'Present',
                 'actual': 'Missing',
                 'severity': 'Critical',
-                'recommendation': f'Ensure user {baseline_user} exists'
+                'recommendation': f"Ensure user {baseline_user} exists"
             })
 
-    # Firewall rules comparison
+    # Firewall rules
     baseline_rules = set(baseline.get('firewall', []))
-    actual_rules = set(extracted['firewall'].splitlines())
+    actual_rules = set(extracted.get('firewall', '').splitlines())
     for rule in baseline_rules - actual_rules:
         violations.append({
             'type': 'firewall',
@@ -89,13 +104,14 @@ def compare_to_baseline(extracted, baseline):
             'expected': 'Present',
             'actual': 'Missing',
             'severity': 'Warning',
-            'recommendation': f'Add firewall rule: {rule}'
+            'recommendation': f"Add firewall rule: {rule}"
         })
 
     return violations
 
 
 def calculate_security_score(violations):
+    """Calculate score based on violations."""
     score = 100
     for v in violations:
         if v['severity'] == 'Critical':
@@ -106,6 +122,7 @@ def calculate_security_score(violations):
 
 
 def generate_report(hostname, username, violations, score):
+    """Print summary and save detailed JSON report."""
     report = {
         'hostname': hostname,
         'username': username,
@@ -113,14 +130,13 @@ def generate_report(hostname, username, violations, score):
         'violations': violations
     }
 
-    # Print summary grouped by severity
+    # Group violations by severity for display
     grouped = {'Critical': [], 'Warning': []}
     for v in violations:
         grouped[v['severity']].append(v)
 
-    print(f"\nReport for {hostname} ({username})")
+    print(f"\n--- Report for {hostname} ({username}) ---")
     print(f"Security Score: {score}/100")
-
     for severity, items in grouped.items():
         if items:
             print(f"\n{severity} Violations:")
@@ -128,31 +144,53 @@ def generate_report(hostname, username, violations, score):
                 print(f"- {v['type']}: {v['item']}, Expected: {v['expected']}, Actual: {v['actual']}")
                 print(f"  Recommendation: {v['recommendation']}")
 
+    # Save JSON report
     report_file = os.path.join(REPORTS_DIR, f"{hostname}_{username}_report.json")
     with open(report_file, 'w') as f:
         json.dump(report, f, indent=4)
-    print(f"\nDetailed JSON report saved to {report_file}")
+    print(f"JSON report saved: {report_file}")
 
 
 def main():
     devices = load_yaml(DEVICE_INVENTORY_FILE)
+    if not devices:
+        print("No devices found in inventory. Exiting.")
+        return
+
+    # Load the three separate baseline YAMLs
+    baseline_ssh = load_yaml(os.path.join(BASELINE_DIR, "ssh_baseline.yaml"))
+    baseline_users = load_yaml(os.path.join(BASELINE_DIR, "users_baseline.yaml"))
+    baseline_firewall = load_yaml(os.path.join(BASELINE_DIR, "firewall_baseline.yaml"))
+
+    # Merge all into a single baseline dictionary
+    baseline = {**baseline_ssh, **baseline_users, **baseline_firewall}
 
     for device in devices.get('devices', []):
-        hostname = device['hostname']
-        device_type = device['type']
+        hostname = device.get('hostname')
+        device_type = device.get('type')
+        users = device.get('users', [])
 
-        for user in device.get('users', []):
-            username = user['username']
-            password = user['password']
+        if not hostname or not device_type:
+            print(f"Skipping invalid device entry: {device}")
+            continue
+
+        if not users:
+            print(f"No users defined for device {hostname}, skipping.")
+            continue
+
+        for user in users:
+            username = user.get('username')
+            password = user.get('password')
+
+            if not username or not password:
+                print(f"Skipping invalid user entry on {hostname}: {user}")
+                continue
 
             print(f"\nConnecting to {hostname} as {username}...")
             try:
                 client = ssh_connect(hostname, username, password)
                 extracted = extract_config(client)
                 client.close()
-
-                baseline_file = os.path.join(BASELINE_DIR, f"{device_type}_baseline.yaml")
-                baseline = load_yaml(baseline_file)
 
                 violations = compare_to_baseline(extracted, baseline)
                 score = calculate_security_score(violations)
@@ -164,3 +202,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
