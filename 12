@@ -1,0 +1,203 @@
+import re
+import json
+import yaml
+import paramiko
+from pathlib import Path
+
+# load the device inventory and extract configs via SSH
+def fetch_configs_for_device(device_name, host_map):
+    target = host_map[device_name]
+    print(f"Connecting to {target['hostname']} ({target['ip']})...")
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(target["ip"], username=target["username"], password=target["password"])
+
+    def remote_file(path):
+        stdin, stdout, stderr = ssh.exec_command(f"sudo cat {path}")
+        return stdout.read().decode()
+
+    def remote_command(command):
+        stdin, stdout, stderr = ssh.exec_command(command)
+        return stdout.read().decode()
+
+    sshd_config = remote_file("/etc/ssh/sshd_config")
+    passwd = remote_file("/etc/passwd")
+    ufw = remote_command("sudo ufw status numbered")
+
+    ssh.close()
+    return {
+        "hostname": target["hostname"],
+        "sshd_config": sshd_config,
+        "passwd": passwd,
+        "ufw": ufw
+    }
+
+#parse the sshd_config, ignoring commented and blank lines
+def parse_sshd_config(lines):
+    config = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            key = parts[0]
+            value = " ".join(parts[1:])
+            config[key] = value
+    return config
+
+#extract port and status 
+def extract_ufw_rules(lines):
+    rules = []
+    for line in lines:
+        match = re.match(r"\[\s*\d+\]\s+([0-9]+)/(tcp|udp)(?: \(v6\))?\s+(ALLOW|DENY)\s+IN", line)
+        if match:
+            port = int(match.group(1))
+            proto = match.group(2).lower()
+            action = match.group(3).upper()
+            rules.append((port, proto, action))
+    return rules
+
+# Normalize actions values between UFW and baseline
+def normalize_action(action):
+    return {"ACCEPT": "ALLOW", "DROP": "DENY"}.get(action.upper(), action.upper())
+
+#Evaluate user rules against baseline
+def eval_user_rule(user_entry, must_exist, users_on_system, hostname, local_violations):
+    username = user_entry["username"]
+    exists = username in users_on_system
+    violation = (must_exist and not exists) or (not must_exist and exists)
+    if violation:
+        severity = user_entry["severity"]
+        local_violations[severity].append({
+            "remediation": user_entry["description"],
+            "username": username,
+            "expected": "present" if must_exist else "absent",
+            "actual": "present" if exists else "absent",
+            "baseline_violation": "users",
+            "device": hostname
+        })
+        return 15 if severity == "critical" else 5
+    return 0
+
+#Logic to analyze vm configs against baselines
+def analyze_device(device, ssh_baseline, firewall_baseline, users_baseline):
+    sshd_lines = device["sshd_config"].splitlines()
+    ufw_lines = device["ufw"].splitlines()
+    passwd_lines = device["passwd"].splitlines()
+    hostname = device["hostname"]
+
+    local_score = 100
+    local_violations = {"critical": [], "warning": []}
+
+    # Report entry for sshd_config
+    sshd_config = parse_sshd_config(sshd_lines)
+    for key, expected_val in ssh_baseline.get("ssh_config", {}).items():
+        actual_val = sshd_config.get(key, "not found")
+        if str(actual_val).lower() != str(expected_val).lower():
+            match = next((rule for rule in ssh_baseline.get("compliance_rules", []) if rule["parameter"] == key), None)
+            if match:
+                severity = match["severity"]
+                local_violations[severity].append({
+                    "remediation": match["rule"],
+                    "parameter": key,
+                    "expected": expected_val,
+                    "actual": actual_val,
+                    "baseline_violation": "ssh",
+                    "device": hostname
+                })
+                local_score -= 15 if severity == "critical" else 5
+
+    ufw_rules = extract_ufw_rules(ufw_lines)
+    ufw_rules_set = set((port, proto, action) for (port, proto, action) in ufw_rules)
+    
+    # Firewall report entry for ufw rules
+    for rule in firewall_baseline.get("required_rules", []) + firewall_baseline.get("blocked_rules", []):
+        port = rule["port"]
+        proto = rule["protocol"].lower()
+        expected_action = normalize_action(rule["action"]) if "action" in rule else "DENY"
+        severity = rule["severity"]
+
+        if rule in firewall_baseline.get("required_rules", []):
+            found_port_proto = [(p, pr, a) for (p, pr, a) in ufw_rules if p == port and pr == proto]
+            actual = found_port_proto[0][2] if found_port_proto else "not found"
+            if (port, proto, expected_action) not in ufw_rules_set:
+                local_violations[severity].append({
+                    "remediation": rule["description"],
+                    "port": port,
+                    "protocol": proto,
+                    "expected_action": expected_action,
+                    "actual": actual,
+                    "baseline_violation": "firewall",
+                    "device": hostname
+                })
+                local_score -= 15 if severity == "critical" else 5
+        else:
+            if (port, proto, "ALLOW") in ufw_rules_set:
+                local_violations[severity].append({
+                    "remediation": rule["description"],
+                    "port": port,
+                    "protocol": proto,
+                    "expected_action": "DENY",
+                    "actual": "ALLOW",
+                    "baseline_violation": "firewall",
+                    "device": hostname
+                })
+                local_score -= 15 if severity == "critical" else 5
+
+    # User report entry formatting 
+    users_on_system = [line.split(":")[0] for line in passwd_lines if line and not line.startswith("#")]
+    for u in users_baseline.get("required_users", []):
+        local_score -= eval_user_rule(u, must_exist=True, users_on_system=users_on_system, hostname=hostname, local_violations=local_violations)
+    for u in users_baseline.get("prohibited_users", []):
+        local_score -= eval_user_rule(u, must_exist=False, users_on_system=users_on_system, hostname=hostname, local_violations=local_violations)
+
+    return local_score, local_violations
+
+# logic is structured using main for readability and flow 
+def main():
+    inventory_path = Path("device_inventory.yaml")
+    devices = yaml.safe_load(inventory_path.read_text())["devices"]
+    host_map = {d["hostname"]: d for d in devices}
+
+    # user has the option to choose which two devices to audit
+    device_configs = []
+    for i in range(2): # hardcoded for ease of testing only two devices
+        print("\nAvailable Devices:")
+        for d in devices:
+            print(f"- {d['hostname']}: {d['description']}")
+        target_host = input(f"Enter the hostname to audit (e.g. device-01) [{i+1}/2]: ").strip()
+        if target_host not in host_map:
+            print(f"Error: device '{target_host}' not found in inventory.")
+            exit(1)
+        device_configs.append(fetch_configs_for_device(target_host, host_map))
+        if i == 0:
+            input("Audit of first device complete. Press Enter to continue to the second VM...\n")
+
+    base_dir = Path.cwd()
+    baseline_dir = base_dir / "baselines"
+    report_dir = base_dir / "reports"
+    report_dir.mkdir(exist_ok=True)
+
+    ssh_baseline = yaml.safe_load((baseline_dir / "ssh_baseline.yaml").read_text())
+    firewall_baseline = yaml.safe_load((baseline_dir / "firewall_baseline.yaml").read_text())
+    users_baseline = yaml.safe_load((baseline_dir / "users_baseline.yaml").read_text())
+
+    final_report = {
+        "score": 100,
+        "violations": {"critical": [], "warning": []}
+    }
+
+    #assign final score based on severity of violations
+    for device in device_configs:
+        local_score, local_violations = analyze_device(device, ssh_baseline, firewall_baseline, users_baseline)
+        final_report["score"] = max(final_report["score"] - (100 - local_score), 0)
+        for sev in ["critical", "warning"]:
+            final_report["violations"][sev].extend(local_violations[sev])
+
+    (report_dir / "baseline_violation_report.json").write_text(json.dumps(final_report, indent=2))
+    print("Report saved to reports/baseline_violation_report.json")
+
+if __name__ == "__main__":
+    main()
