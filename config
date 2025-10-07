@@ -1,0 +1,93 @@
+ssh_config:
+  PermitRootLogin: "no"
+  PasswordAuthentication: "yes"
+  PubkeyAuthentication: "yes"
+  PermitEmptyPasswords: "no"
+  X11Forwarding: "no"
+  MaxAuthTries: 3
+  Port: 22
+  Protocol: 2
+
+compliance_rules:
+  - rule: "Root login must be disabled"
+    parameter: "PermitRootLogin"
+    expected: "no"
+    severity: "critical"
+  
+  - rule: "Empty passwords must be prohibited"
+    parameter: "PermitEmptyPasswords"
+    expected: "no"
+    severity: "critical"
+  
+  - rule: "Max authentication tries should be 3 or less"
+    parameter: "MaxAuthTries"
+    expected: "3"
+    severity: "warning"
+
+
+
+required_rules:
+  - port: 22
+    protocol: tcp
+    action: ACCEPT
+    description: "SSH access must be allowed"
+    severity: "critical"
+  
+  - port: 443
+    protocol: tcp
+    action: ACCEPT
+    description: "HTTPS should be allowed"
+    severity: "warning"
+
+blocked_rules:
+  - port: 23
+    protocol: tcp
+    action: DROP
+    description: "Telnet must be blocked"
+    severity: "critical"
+  
+  - port: 21
+    protocol: tcp
+    action: DROP
+    description: "FTP should be blocked"
+    severity: "warning"
+
+default_policy:
+  INPUT: DROP
+  FORWARD: DROP
+  OUTPUT: ACCEPT
+
+
+
+required_users:
+  - username: audituser
+    description: "Audit account must exist"
+    severity: "critical"
+
+prohibited_users:
+  - username: guest
+    description: "Guest account should not exist"
+    severity: "warning"
+  
+  - username: test
+    description: "Test accounts should be removed"
+    severity: "warning"
+
+password_policy:
+  max_days: 90
+  min_days: 1
+  warn_age: 7
+
+
+
+  - hostname: "device-01"
+    ip: "192.168.56.103"  # Replace with your VM2 IP
+    username: "audituser"
+    password: "AuditPass123"
+    description: "Network Device 1"
+  
+  - hostname: "device-02"
+    ip: "192.168.56.104"  # Replace with your VM3 IP
+    username: "audituser"
+    password: "AuditPass123"
+    description: "Network Device 2"
