@@ -1,3 +1,6 @@
-curl -X POST http://localhost:5000/add \
-  -H "Content-Type: application/json" \
-  -d '{"a": 10}'
+curl -X POST http://localhost:5001/ \
+  -H "Content-Type: text/xml" \
+  -d '<?xml version="1.0"?>
+<soap:Envelope>
+  <InvalidTag>
+</soap:Envelope>'
